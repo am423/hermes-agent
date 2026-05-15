@@ -362,6 +362,8 @@ Set `XAI_API_KEY` in `~/.hermes/.env` or via `hermes model`.
 
 When using any xAI endpoint (base URL containing `x.ai`), Hermes automatically sends the `x-grok-conv-id` header for prompt caching.
 
+See the dedicated guide for setup details: [Grok OAuth (via Grok CLI Login)](../guides/grok-oauth.md).
+
 xAI also provides a dedicated TTS endpoint. Select **xAI TTS** in `hermes tools` → Voice & TTS.
 
 **Choosing between the two:**
