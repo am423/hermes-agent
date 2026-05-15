@@ -76,6 +76,13 @@ def _detect_api_mode_for_url(base_url: str) -> Optional[str]:
     normalized = (base_url or "").strip().lower().rstrip("/")
     hostname = base_url_hostname(base_url)
     if hostname == "api.x.ai":
+        # NOTE: Official "xai" provider (XAI_API_KEY) still forces codex_responses via
+        # the explicit branch in _resolve_api_key_provider.  For "xai-oauth" (Grok CLI
+        # imported tokens) and any custom provider whose name contains xai-oauth, we
+        # intentionally return chat_completions here because those tokens only grant
+        # access to the /chat/completions compatibility surface today.  The Responses
+        # API (/v1/responses) produces the "response.created before `error`" failure
+        # observed in the wild.
         return "codex_responses"
     if hostname == "api.openai.com":
         return "codex_responses"
@@ -84,6 +91,26 @@ def _detect_api_mode_for_url(base_url: str) -> Optional[str]:
     if hostname == "api.kimi.com" and "/coding" in normalized:
         return "anthropic_messages"
     return None
+
+
+def _effective_api_mode_for_xai(base_url: str, provider_name: Optional[str] = None) -> Optional[str]:
+    """Wrapper around _detect_api_mode_for_url that protects xai-oauth flows.
+
+    Grok-CLI-imported OAuth tokens (source="grok-cli", provider "xai-oauth" or any
+    custom provider whose name contains it) only work reliably against the
+    /chat/completions surface.  Forcing codex_responses on those tokens produces
+    the exact "Expected to have received `response.created` before `error`" that
+    the user hit on grok-4.3.
+    """
+    detected = _detect_api_mode_for_url(base_url)
+    if detected != "codex_responses":
+        return detected
+    if not provider_name:
+        return detected
+    pn = provider_name.lower()
+    if "xai-oauth" in pn or pn.startswith("xai-") or pn == "xai-oauth":
+        return "chat_completions"
+    return detected
 
 
 def _auto_detect_local_model(base_url: str) -> str:
@@ -250,6 +277,20 @@ def _resolve_runtime_from_pool_entry(
         api_mode = "anthropic_messages"
         pconfig = PROVIDER_REGISTRY.get(provider)
         base_url = base_url or (pconfig.inference_base_url if pconfig else "")
+    elif provider == "xai-oauth":
+        # Grok-CLI / grok.com OAuth tokens only support the chat/completions
+        # compatibility layer.  Using codex_responses against /v1/responses with
+        # these tokens reliably produces the SDK error the user saw:
+        # "Expected to have received `response.created` before `error`".
+        api_mode = "chat_completions"
+        base_url = base_url or "https://api.x.ai/v1"
+        try:
+            from hermes_cli.auth import resolve_xai_oauth_runtime_credentials
+            creds = resolve_xai_oauth_runtime_credentials()
+            api_key = creds.get("api_key") or api_key
+            base_url = creds.get("base_url") or base_url
+        except Exception as e:
+            logger.debug("xai-oauth credential resolution failed: %s", e)
     elif provider == "anthropic":
         api_mode = "anthropic_messages"
         cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
@@ -318,8 +359,9 @@ def _resolve_runtime_from_pool_entry(
         else:
             # Auto-detect Anthropic-compatible endpoints (/anthropic suffix,
             # Kimi /coding, api.openai.com → codex_responses, api.x.ai →
-            # codex_responses).
-            detected = _detect_api_mode_for_url(base_url)
+            # codex_responses).  The xai-oauth special case is handled inside
+            # _effective_api_mode_for_xai.
+            detected = _effective_api_mode_for_xai(base_url, provider)
             if detected:
                 api_mode = detected
 
@@ -388,7 +430,7 @@ def _try_resolve_from_custom_pool(
             return None
         return {
             "provider": provider_label,
-            "api_mode": api_mode_override or _detect_api_mode_for_url(base_url) or "chat_completions",
+            "api_mode": api_mode_override or _effective_api_mode_for_xai(base_url, provider_name) or "chat_completions",
             "base_url": base_url,
             "api_key": pool_api_key,
             "source": f"pool:{pool_key}",
@@ -561,7 +603,7 @@ def _resolve_named_custom_runtime(
         ) or "no-key-required"
         return {
             "provider": "custom",
-            "api_mode": _detect_api_mode_for_url(base_url) or "chat_completions",
+            "api_mode": _effective_api_mode_for_xai(base_url, requested_provider) or "chat_completions",
             "base_url": base_url,
             "api_key": api_key,
             "source": "direct-alias",
@@ -601,7 +643,7 @@ def _resolve_named_custom_runtime(
     result = {
         "provider": "custom",
         "api_mode": custom_provider.get("api_mode")
-        or _detect_api_mode_for_url(base_url)
+        or _effective_api_mode_for_xai(base_url, requested_provider)
         or "chat_completions",
         "base_url": base_url,
         "api_key": api_key or "no-key-required",
@@ -935,7 +977,8 @@ def _resolve_explicit_runtime(
             else:
                 # Auto-detect from URL (Anthropic /anthropic suffix,
                 # api.openai.com → Responses, Kimi /coding, etc.).
-                detected = _detect_api_mode_for_url(base_url)
+                # _effective... protects any xai-oauth variant that might reach here.
+                detected = _effective_api_mode_for_xai(base_url, provider)
                 if detected:
                     api_mode = detected
 
@@ -1372,7 +1415,8 @@ def resolve_runtime_provider(
                 # Auto-detect Anthropic-compatible endpoints by URL convention
                 # (e.g. https://api.minimax.io/anthropic, https://dashscope.../anthropic)
                 # plus api.openai.com → codex_responses and api.x.ai → codex_responses.
-                detected = _detect_api_mode_for_url(base_url)
+                # _effective... keeps xai-oauth safe.
+                detected = _effective_api_mode_for_xai(base_url, provider)
                 if detected:
                     api_mode = detected
         # Strip trailing /v1 for OpenCode Anthropic models (see comment above).

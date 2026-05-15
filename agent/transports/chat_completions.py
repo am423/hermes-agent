@@ -383,6 +383,18 @@ class ChatCompletionsTransport(ProviderTransport):
         if extra_body:
             api_kwargs["extra_body"] = extra_body
 
+        # xAI Grok prompt caching — send x-grok-conv-id for any *.x.ai base URL
+        # when a session_id is present. This works for both the direct `xai-oauth`
+        # (chat_completions) path and the `xai` API-key path (codex_responses).
+        # Matches the documented behavior in the official Hermes + xAI integration.
+        base_url_for_xai = str(params.get("base_url") or "").lower()
+        if "x.ai" in base_url_for_xai:
+            sess = params.get("session_id")
+            if sess:
+                eh = api_kwargs.setdefault("extra_headers", {})
+                if isinstance(eh, dict):
+                    eh["x-grok-conv-id"] = str(sess)
+
         # Request overrides last (service_tier etc.)
         overrides = params.get("request_overrides")
         if overrides:
