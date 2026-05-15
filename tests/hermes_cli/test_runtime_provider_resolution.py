@@ -2321,3 +2321,37 @@ def test_minimax_oauth_pool_forces_anthropic_messages_despite_stale_config(monke
     assert resolved["provider"] == "minimax-oauth"
     assert resolved["api_mode"] == "anthropic_messages"
     assert resolved["base_url"] == "https://api.minimax.io/anthropic"
+
+
+def test_resolve_runtime_provider_xai_oauth_uses_chat_completions(monkeypatch):
+    """xai-oauth (Grok CLI OAuth) must use chat_completions, never codex_responses.
+
+    OAuth tokens from the official Grok CLI only have access to the
+    /chat/completions surface. Attempting codex_responses produces the
+    "response.created before `error`" failure.
+    """
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "xai-oauth")
+
+    # Simulate a credential pool entry for xai-oauth (like real Grok CLI import)
+    class _Entry:
+        access_token = "grok-cli-oauth-token"
+        source = "grok-cli"
+        base_url = "https://api.x.ai/v1"
+
+    class _Pool:
+        def has_credentials(self):
+            return True
+
+        def select(self):
+            return _Entry()
+
+    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
+    monkeypatch.setattr(rp, "_resolve_named_custom_runtime", lambda **k: None)
+    monkeypatch.setattr(rp, "_resolve_explicit_runtime", lambda **k: None)
+
+    resolved = rp.resolve_runtime_provider(requested="xai-oauth")
+
+    assert resolved["provider"] == "xai-oauth"
+    assert resolved["api_mode"] == "chat_completions"
+    assert resolved["base_url"] == "https://api.x.ai/v1"
+    assert "grok-cli" in resolved.get("source", "")

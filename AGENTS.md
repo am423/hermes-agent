@@ -549,6 +549,12 @@ without an explicit `kind:` get auto-coerced via a source-text heuristic
 
 Full authoring guide: `website/docs/developer-guide/model-provider-plugin.md`.
 
+**Special note for OAuth providers** (e.g. `xai-oauth`, `qwen-oauth`, `minimax-oauth`):
+- These almost always use `auth_type="oauth_external"`.
+- Runtime resolution in `hermes_cli/runtime_provider.py` often forces a specific `api_mode` (commonly `chat_completions`).
+- Context length fallbacks in `agent/model_metadata.py` must be accurate because the live `/models` endpoint frequently does not return reliable `context_length` for OAuth tokens.
+- Always test both the credential pool path and the explicit `resolve_*_runtime_credentials` path.
+
 ### Dashboard / context-engine / image-gen plugin directories
 
 `plugins/context_engine/`, `plugins/image_gen/`, etc. follow the same
