@@ -277,6 +277,39 @@ test('a member @-mentioned by another bot joins the NEXT round', async () => {
   assert.equal(texts.some(t => t.startsWith('builder: On it')), true)
 })
 
+test('parallel round: mentioned members turn concurrently and commit both replies', async () => {
+  const gc = load((profile, prompt) => {
+    if (profile === 'research' && prompt.includes('REQ')) return 'research answer'
+    if (profile === 'builder' && prompt.includes('REQ')) return 'builder answer'
+    return '(pass)'
+  })
+
+  gc.sendToGroupChat('Parallel', [{ name: 'research', title: '' }, { name: 'builder', title: '' }], '@research @builder REQ')
+  for (let i = 0; i < 200 && (gc.$groupChats.get().Parallel || {}).running; i++) {
+    await new Promise(resolve => setImmediate(resolve))
+  }
+
+  // Both mentioned members took a turn in the SAME round.
+  const researchCall = gc.calls.find(c => c.profile === 'research' && c.prompt.includes('REQ'))
+  const builderCall = gc.calls.find(c => c.profile === 'builder' && c.prompt.includes('REQ'))
+  assert.ok(researchCall && builderCall, 'both mentioned members took their turn')
+  // Parallel contract: one shared snapshot base — a peer's same-round reply
+  // is not in either member's delta.
+  assert.ok(!researchCall.prompt.includes('builder answer'), "research did not see builder's same-round reply")
+  assert.ok(!builderCall.prompt.includes('research answer'), "builder did not see research's same-round reply")
+  // Both replies still land in the room log, in roster order.
+  const texts = roomLog(gc, 'Parallel').map(e => `${e.from.name}: ${e.text}`)
+  assert.ok(texts.includes('research: research answer'))
+  assert.ok(texts.includes('builder: builder answer'))
+  // Next round: the earlier-committing member sees the peer's reply as new
+  // delta; the later-committing member's watermark already covers the round,
+  // so it does not re-turn. The room settles after that.
+  const researchSecond = gc.calls.find(c => c.profile === 'research' && c.prompt.includes('builder answer'))
+  assert.ok(researchSecond, "research saw builder's reply in the next round's delta")
+  assert.equal(gc.calls.filter(c => c.profile === 'builder').length, 1, 'builder does not re-turn (its watermark covers the round)')
+  assert.equal((gc.$groupChats.get().Parallel || {}).running, false, 'room settled')
+})
+
 test('settle: everyone passing ends the room turn with only the user message logged', async () => {
   const gc = load(() => '(pass)')
 
@@ -1629,8 +1662,11 @@ test('source contract: long visible turns extend the deadline up to a hard cap',
 
 test('source contract: the working line names the member on turn', () => {
   assert.match(pluginSource, /is thinking…/)
-  assert.match(pluginSource, /r\.turn = member\.name/)
+  // Parallel rounds list every member on turn; single-member rounds keep the
+  // bare-name shape (room.turn is a string or an array of names).
+  assert.match(pluginSource, /r\.turn = turns\.length === 1 \? turns\[0\]\.member\.name : turns\.map\(t => t\.member\.name\)/)
   assert.match(pluginSource, /r\.turn = null/)
+  assert.match(pluginSource, /Array\.isArray\(room\.turn\)/)
 })
 
 test('source contract: creating a group with a taken name mints a fresh room, never reopens the old log', () => {

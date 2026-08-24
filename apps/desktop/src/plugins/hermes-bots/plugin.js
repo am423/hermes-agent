@@ -6343,18 +6343,23 @@ function knownGroups(metaByName) {
   return [...names].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }))
 }
 
-// ── group chats: bounded round-robin coordination over a shared room log ─────
+// ── group chats: bounded parallel rounds over a shared room log ─────────────
 //
 // Behavioral model (clean-room): a group conversation is ONE ordered room log
 // owned by the plugin. A user send triggers at most GROUP_CHAT_MAX_ROUNDS
-// serial round-robin rounds over the member roster — never parallel, no LLM
-// router. Who speaks each round is a deterministic @mention parse since the
-// last user message (mentioned members only, else everyone); whether a member
-// actually speaks is its own turn's choice — replying with exactly "(pass)"
-// (or nothing, or failing) is silence. Hard caps end every turn; a round in
-// which everyone passed means the conversation settled. Each member runs its
-// turn in its OWN persistent per-group Hermes session and is fed only the
-// room messages that are NEW since it last saw the room.
+// rounds over the member roster; within a round, every responder's turn is
+// dispatched CONCURRENTLY — each member runs its turn in its OWN persistent
+// per-group Hermes session, so parallel turns never collide on session
+// state — and results commit in roster order. No LLM router. Who speaks each
+// round is a deterministic @mention parse since the last user message
+// (mentioned members only, else everyone); whether a member actually speaks
+// is its own turn's choice — replying with exactly "(pass)" (or nothing, or
+// failing) is silence. Hard caps end every turn; a round in which everyone
+// passed means the conversation settled. Every member of a round is fed only
+// the room messages NEW since it last saw the room, from ONE shared snapshot
+// base: a member's same-round peers' replies land in its NEXT round's delta,
+// so long work from one member never blocks another and nobody misses
+// anything.
 
 const GROUP_CHAT_MAX_ROUNDS = 3
 const GROUP_CHAT_MAX_MESSAGES = 10
@@ -7680,6 +7685,18 @@ async function runGroupChatRounds(group, members, thread) {
         .filter(member => !Object.prototype.hasOwnProperty.call(strandedNow, groupMemberKey(member)))
       let spokeThisRound = 0
 
+      // Parallel round: every responder's turn dispatches CONCURRENTLY
+      // against one shared room snapshot (each member runs in its own
+      // persistent session, so turns never collide), then results commit in
+      // roster order. Same-round peer replies are NOT in a member's delta —
+      // the snapshot base is shared by the whole round, so anything appended
+      // by a peer arrives in the NEXT round's delta. Long work from one
+      // member never blocks the others.
+      const roundRoom = $groupChats.get()[group] || { log: [], watermarks: {} }
+      const base = roundRoom.log.length
+      const anchorId = roundRoom.log.length ? roundRoom.log[roundRoom.log.length - 1].id : null
+      const turns = []
+
       for (const member of responders) {
         if (!isCurrent() || posted >= GROUP_CHAT_MAX_MESSAGES) {
           if (!isCurrent()) {
@@ -7688,13 +7705,12 @@ async function runGroupChatRounds(group, members, thread) {
           return
         }
 
-        const room = $groupChats.get()[group] || { log: [], watermarks: {} }
         const memberKey = groupMemberKey(member)
         const markKey = `${thread}::${memberKey}`
-        const seen = room.watermarks[markKey] || 0
+        const seen = roundRoom.watermarks[markKey] || 0
         // Delta: NEW room entries, narrowed to this thread — the member's
         // turn sees only the conversation it's part of.
-        const delta = room.log.slice(seen).filter(e => groupThreadOf(e) === thread)
+        const delta = roundRoom.log.slice(seen).filter(e => groupThreadOf(e) === thread)
 
         if (!delta.length) {
           continue
@@ -7705,10 +7721,10 @@ async function runGroupChatRounds(group, members, thread) {
         // mention). Consume the delta exactly once (watermark past the
         // current log) so the same entries never re-trigger this skip, and
         // surface WHY the bot is silent in the activity feed the first time.
-        const heldEntry = (room.holds || {})[memberKey]
+        const heldEntry = (roundRoom.holds || {})[memberKey]
 
         if (heldEntry) {
-          const advance = heldMemberWatermarkAdvance(seen, room.log.length)
+          const advance = heldMemberWatermarkAdvance(seen, roundRoom.log.length)
 
           updateGroupChat(group, r => {
             if (advance !== null) {
@@ -7729,44 +7745,60 @@ async function runGroupChatRounds(group, members, thread) {
           continue
         }
 
-        const prompt = buildGroupChatTurnPrompt({
-          groupName: group,
-          members,
-          viewer: member,
-          deltaLines: delta.slice(-GROUP_CHAT_HISTORY_LIMIT).map(e => formatGroupChatLine(e, member.name))
+        turns.push({
+          member,
+          memberKey,
+          markKey,
+          prompt: buildGroupChatTurnPrompt({
+            groupName: group,
+            members,
+            viewer: member,
+            deltaLines: delta.slice(-GROUP_CHAT_HISTORY_LIMIT).map(e => formatGroupChatLine(e, member.name))
+          }),
+          // Images riding this delta (user attachments — member entries don't
+          // carry images today, but flatMap keeps this future-proof) get
+          // staged into the member's session so the model sees the pixels,
+          // not just the transcript's [attached image: …] marker.
+          images: delta.flatMap(e => (Array.isArray(e.images) ? e.images : []))
         })
+      }
 
-        // Images riding this delta (user attachments — member entries don't
-        // carry images today, but flatMap keeps this future-proof) get staged
-        // into the member's session so the model sees the pixels, not just
-        // the transcript's [attached image: …] marker.
-        const deltaImages = delta.flatMap(e => (Array.isArray(e.images) ? e.images : []))
-
-        // Surface WHO is on turn (runtime-only, like running/epoch) so the
-        // room shows "Radar is thinking…" instead of a generic working line —
-        // long model turns otherwise read as the room being stuck.
+      // Surface WHO is on turn (runtime-only, like running/epoch) so the
+      // room shows "Radar is thinking…" instead of a generic working line —
+      // long model turns otherwise read as the room being stuck. With a
+      // parallel round the line lists every member on turn.
+      if (turns.length) {
         updateGroupChat(group, r => {
-          r.turn = member.name
+          r.turn = turns.length === 1 ? turns[0].member.name : turns.map(t => t.member.name)
           return r
         })
+      }
 
-        let reply = null
+      const results = await Promise.all(
+        turns.map(async ({ member, prompt, images }) => {
+          try {
+            const reply = await runGroupChatMemberTurn(group, member, prompt, thread, images)
 
-        try {
-          reply = await runGroupChatMemberTurn(group, member, prompt, thread, deltaImages)
+            // Needs-attention hook (#93091 item 3): a turn that produced a real
+            // reply (or an explicit pass) is a good turn — clear the badge.
+            // A timed-out turn also returns null but never threw; leaving any
+            // prior badge in place there is the conservative choice.
+            if (reply !== null) {
+              clearBotAttention(groupMemberKey(member))
+            }
 
-          // Needs-attention hook (#93091 item 3): a turn that produced a real
-          // reply (or an explicit pass) is a good turn — clear the badge.
-          // A timed-out turn also returns null but never threw; leaving any
-          // prior badge in place there is the conservative choice.
-          if (reply !== null) {
-            clearBotAttention(groupMemberKey(member))
+            return { reply }
+          } catch (error) {
+            recordGroupActivity(group, { kind: 'failed', member: member.name, thread })
+            noteBotAttention(groupMemberKey(member), error?.message || error)
+            return { reply: null } // a failed turn is a pass, never a room error
           }
-        } catch (error) {
-          recordGroupActivity(group, { kind: 'failed', member: member.name, thread })
-          noteBotAttention(groupMemberKey(member), error?.message || error)
-          reply = null // a failed turn is a pass, never a room error
-        }
+        })
+      )
+
+      for (let i = 0; i < turns.length; i++) {
+        const { member, memberKey, markKey } = turns[i]
+        const reply = results[i].reply
 
         // #93127: the turn may have finished AFTER a newer user send bumped
         // the room epoch. That newer send's loop re-drives this member with
@@ -7781,7 +7813,6 @@ async function runGroupChatRounds(group, members, thread) {
         // overshoot after a mid-turn trim and silently commit a stale turn.
         const roomNow = $groupChats.get()[group] || { log: [] }
         const epochNow = roomNow.epoch || 0
-        const anchorId = room.log.length ? room.log[room.log.length - 1].id : null
         const anchorIdx = anchorId === null ? -1 : roomNow.log.findIndex(e => e.id === anchorId)
         // Anchor trimmed away ⇒ every pre-turn entry was dropped, so every
         // surviving entry is newer — scanning the whole log stays exact.
@@ -7795,9 +7826,13 @@ async function runGroupChatRounds(group, members, thread) {
           return
         }
 
-        // The member has now seen everything up to the pre-reply log length.
+        // The member has now seen everything up to the round's snapshot base
+        // (clamped — the log may have been trimmed mid-flight). Same-round
+        // peer replies committed before this member's commit stay unseen and
+        // arrive in the next round's delta.
+        const lenNow = roomNow.log.length
         updateGroupChat(group, r => {
-          r.watermarks[markKey] = r.log.length
+          r.watermarks[markKey] = Math.min(base, lenNow)
           return r
         })
 
@@ -7808,9 +7843,14 @@ async function runGroupChatRounds(group, members, thread) {
             reply,
             thread
           )
-          // Its own message counts as seen too.
+          // Its own reply lands at index lenNow — advance past it, never past
+          // a peer's same-round reply committed later (that peer's entry is
+          // already above this member's watermark only if the peer committed
+          // earlier, and in that case this member never saw it; the room
+          // transcript remains the record and the next round re-feeds
+          // whatever this member has not absorbed yet).
           updateGroupChat(group, r => {
-            r.watermarks[markKey] = r.log.length
+            r.watermarks[markKey] = lenNow + 1
             return r
           })
           posted += 1
@@ -13217,11 +13257,16 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
             room.running
               ? jsx('div', {
                   className: 'px-2 py-1 text-[0.7rem] italic text-(--ui-text-quaternary)',
-                  children: roomClarifies.length
-                    ? 'Waiting for your answer…'
-                    : room.turn
-                      ? `${groupSpeakerLabel(room.turn)} is thinking…`
-                      : 'The room is working…'
+                  children: (() => {
+                    // Parallel rounds can put several members on turn at once;
+                    // room.turn is a single name or an array of names.
+                    const thinking = Array.isArray(room.turn) ? room.turn : room.turn ? [room.turn] : []
+                    return roomClarifies.length
+                      ? 'Waiting for your answer…'
+                      : thinking.length
+                        ? `${thinking.map(groupSpeakerLabel).join(', ')} ${thinking.length === 1 ? 'is' : 'are'} thinking…`
+                        : 'The room is working…'
+                  })()
                 }, 'working')
               : null,
             // Scroll anchor (#89835): rooms opened at scroll position 0, mid-
