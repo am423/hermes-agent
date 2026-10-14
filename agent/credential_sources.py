@@ -268,6 +268,11 @@ _REGISTRY: List[RemovalStep] = [
         description="auth.json providers.xai-oauth",
     ),
     RemovalStep(
+        provider="meta-oauth", source_id="device_code",
+        remove_fn=_remove_auth_store_oauth,
+        description="auth.json providers.meta-oauth",
+    ),
+    RemovalStep(
         provider="qwen-oauth", source_id="qwen-cli",
         remove_fn=_suppress_only(
             "Suppressed qwen-cli credential — it will not be re-seeded.",

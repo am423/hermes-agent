@@ -3634,6 +3634,7 @@ _POOL_PROVIDER_BY_HOST = (
     ("chatgpt.com", "openai-codex"), ("openrouter.ai", "openrouter"),
     ("inference-api.nousresearch.com", "nous"), ("api.anthropic.com", "anthropic"),
     ("githubcopilot.com", "copilot"), ("api.kimi.com", "kimi-coding"), ("api.x.ai", "xai-oauth"),
+    ("api.meta.ai", "meta-oauth"),
 )
 _AUTH_REFRESH_PROVIDER_BY_HOST = (
     ("api.githubcopilot.com", "copilot"), ("chatgpt.com", "openai-codex"),
@@ -3641,6 +3642,10 @@ _AUTH_REFRESH_PROVIDER_BY_HOST = (
     # An aux call that inherits the main xai-oauth route arrives as "auto"; without this row the
     # 403 bad-credentials rung skipped the refresh and benched the only grant (#84845).
     ("api.x.ai", "xai-oauth"),
+    # Same inheritance for the Meta subscription route (api.meta.ai also serves the
+    # meta-ai API-key sibling; the sibling guard in _auth_refresh_provider_for_route
+    # keeps an API-key 401 from spending the OAuth grant, exactly as for xai).
+    ("api.meta.ai", "meta-oauth"),
 )
 
 
