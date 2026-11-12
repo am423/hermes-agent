@@ -174,7 +174,15 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     ],
     "openai-codex": _codex_curated_models(),
     "xai-oauth": list(_XAI_MODELS),
-    "meta-oauth": ["muse-spark-1.3", "muse-spark-1.3-contributor"],
+    # Subscription-eligible Meta chat models (dev.meta.ai/docs/models +
+    # muse-code/subscriptions, every plan): Spark 1.3 stays first as the
+    # recommended default; Muse Spark 1.1 is Model-API-only (not in Muse
+    # Code) and muse-image-*/muse-voice-*/sam-* are non-chat, so all are
+    # excluded here and filtered from the live catalog by the profiles.
+    "meta-oauth": [
+        "muse-spark-1.3", "muse-wonder-1.0", "muse-ember-1.0",
+        "muse-spark-1.3-contributor", "muse-spark-1.2", "muse-spark-1.2-contributor",
+    ],
     "copilot-acp": ["copilot-acp"],
     "copilot": _OPENAI_CHAT_MODELS + [
         "claude-sonnet-4.6", "claude-sonnet-5", "claude-sonnet-4", "claude-sonnet-4.5", "claude-haiku-4.5",
